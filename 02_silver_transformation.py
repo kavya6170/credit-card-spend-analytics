@@ -1,106 +1,48 @@
 """
-Silver Layer - Data Transformation
-Cleans and transforms bronze data into silver layer
+Silver Layer - Data Transformation and Feature Engineering
+Cleans, transforms, and enriches bronze data into the silver layer
 """
 
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
-import logging
+from pyspark.sql.functions import (
+    col, to_date, current_timestamp, hour, dayofweek, month, year, avg, count, sqrt, pow
+)
+from pyspark.sql.window import Window
+from pyspark import pipelines as dp
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+@dp.materialized_view()
+def silver_credit_transactions():
+    df = spark.table("bronze_credit_transactions")
+    df = (
+        df
+        .dropDuplicates(["transaction_id"])
+        .fillna({"merchant": "UNKNOWN", "category": "UNKNOWN"})
+        .withColumn("amt", col("amt").cast("double"))
+        .withColumn("transaction_date", to_date(col("trans_date_trans_time")))
+        .withColumn("processed_timestamp", current_timestamp())
+        # Feature engineering
+        .withColumn("transaction_hour", hour(col("trans_date_trans_time")))
+        .withColumn("transaction_dayofweek", dayofweek(col("trans_date_trans_time")))
+        .withColumn("transaction_month", month(col("trans_date_trans_time")))
+        .withColumn("transaction_year", year(col("trans_date_trans_time")))
+    )
 
+    # Rolling average transaction amount per cardholder (last 5 transactions)
+    window_spec = Window.partitionBy("cc_num").orderBy("trans_date_trans_time").rowsBetween(-4, 0)
+    df = df.withColumn("rolling_avg_amt_5", avg(col("amt")).over(window_spec))
 
-def run_silver_transformation(spark, input_table="bronze_credit_transactions", 
-                              output_table="silver_credit_transactions"):
-    """
-    Transform bronze data into clean silver layer
-    
-    Args:
-        spark: SparkSession object
-        input_table: Name of bronze Delta table
-        output_table: Name of output silver Delta table
-    
-    Returns:
-        DataFrame: Silver layer DataFrame
-    """
-    try:
-        logger.info("=" * 70)
-        logger.info("Starting Silver Layer ETL - Data Transformation")
-        logger.info("=" * 70)
-        
-        # Read bronze table
-        logger.info(f"Reading from bronze table: {input_table}")
-        bronze_df = spark.table(input_table)
-        logger.info(f"Bronze record count: {bronze_df.count()}")
-        
-        # Apply transformations
-        logger.info("Applying data quality transformations...")
-        
-        silver_df = (
-            bronze_df
-            # Remove duplicate transactions
-            .dropDuplicates(["transaction_id"])
-            
-            # Handle categorical NULLs
-            .fillna({
-                "merchant": "UNKNOWN",
-                "category": "UNKNOWN"
-            })
-            
-            # Cast amount to double
-            .withColumn("amt", col("amt").cast("double"))
-            
-            # Parse transaction date safely
-            .withColumn(
-                "transaction_date",
-                try_cast(col("trans_date_trans_time"), "date")
-            )
-            
-            # Add processing timestamp
-            .withColumn("processed_timestamp", current_timestamp())
+    # Count transactions per cardholder per day
+    window_day = Window.partitionBy(
+        "cc_num", "transaction_year", "transaction_month", "transaction_dayofweek"
+    )
+    df = df.withColumn("txn_count_per_day", count(col("transaction_id")).over(window_day))
+
+    # Distance between cardholder and merchant (Euclidean approximation)
+    df = df.withColumn(
+        "distance_cardholder_merchant",
+        sqrt(
+            pow(col("lat") - col("merch_lat"), 2) +
+            pow(col("long") - col("merch_long"), 2)
         )
-        
-        # Data quality checks
-        initial_count = bronze_df.count()
-        final_count = silver_df.count()
-        duplicates_removed = initial_count - final_count
-        
-        logger.info(f"Data quality summary:")
-        logger.info(f"  - Initial records: {initial_count}")
-        logger.info(f"  - Final records: {final_count}")
-        logger.info(f"  - Duplicates removed: {duplicates_removed}")
-        
-        # Write to Delta table
-        logger.info(f"Writing to Delta table: {output_table}")
-        silver_df.write.format("delta").mode("overwrite").saveAsTable(output_table)
-        
-        logger.info("✅ Silver layer transformation complete")
-        logger.info("=" * 70)
-        
-        return silver_df
-        
-    except Exception as e:
-        logger.error(f"❌ Error in Silver layer transformation: {str(e)}")
-        raise
+    )
 
-
-def main():
-    """Main execution function"""
-    # Configuration
-    INPUT_TABLE = "bronze_credit_transactions"
-    OUTPUT_TABLE = "silver_credit_transactions"
-    
-    # Run transformation
-    silver_df = run_silver_transformation(spark, INPUT_TABLE, OUTPUT_TABLE)
-    
-    # Display sample data
-    silver_df.show(5)
-    silver_df.printSchema()
-    
-    return silver_df
-
-
-if __name__ == "__main__":
-    main()
+    return df
